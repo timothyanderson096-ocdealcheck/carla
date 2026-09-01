@@ -27,7 +27,8 @@
 
 ATrafficLightManager::ATrafficLightManager()
 {
-  PrimaryActorTick.bCanEverTick = false;
+  PrimaryActorTick.bCanEverTick = true;
+  PrimaryActorTick.bStartWithTickEnabled = false;
   SceneComponent = CreateDefaultSubobject<USceneComponent>(TEXT("RootComponent"));
   RootComponent = SceneComponent;
 
@@ -406,6 +407,59 @@ void ATrafficLightManager::InitializeTrafficLights()
   {
     UMapLogicParser::ApplyLaneIdsFromMapLogic(XODRPath, this);
   }
+
+  if (GetWorld()->GetWorldPartition() != nullptr)
+  {
+    SetActorTickEnabled(true);
+  }
+}
+
+void ATrafficLightManager::AdoptModelConfigurationFrom(const ATrafficLightManager& Other)
+{
+  TrafficLightModel_RHT = Other.TrafficLightModel_RHT;
+  TrafficLightModel_LHT = Other.TrafficLightModel_LHT;
+  TrafficSignsModels = Other.TrafficSignsModels;
+  SignComponentModels = Other.SignComponentModels;
+  SpeedLimitModels = Other.SpeedLimitModels;
+}
+
+void ATrafficLightManager::Tick(float DeltaSeconds)
+{
+  Super::Tick(DeltaSeconds);
+  UpdateSignalGroundDormancy();
+}
+
+void ATrafficLightManager::UpdateSignalGroundDormancy()
+{
+  const int32 Num = TrafficSigns.Num();
+  if (Num == 0)
+  {
+    return;
+  }
+  UWorld *World = GetWorld();
+  const int32 Checks = FMath::Min(DormancyChecksPerTick, Num);
+  for (int32 i = 0; i < Checks; ++i)
+  {
+    DormancySweepIndex = (DormancySweepIndex + 1) % Num;
+    ATrafficSignBase *Sign = TrafficSigns[DormancySweepIndex];
+    if (!IsValid(Sign))
+    {
+      continue;
+    }
+    const FVector Origin = Sign->GetActorLocation();
+    FCollisionQueryParams Params(SCENE_QUERY_STAT(SignalGroundDormancy), false, Sign);
+    FHitResult Hit;
+    const bool bGroundResident = World->LineTraceSingleByChannel(
+        Hit,
+        Origin + FVector(0.0f, 0.0f, 50.0f),
+        Origin - FVector(0.0f, 0.0f, DormancyTraceDepth),
+        ECC_Visibility,
+        Params);
+    if (Sign->IsHidden() == bGroundResident)
+    {
+      Sign->SetActorHiddenInGame(!bGroundResident);
+    }
+  }
 }
 
 bool MatchSignalAndActor(const carla::road::Signal &Signal, ATrafficSignBase* ClosestTrafficSign)
@@ -491,6 +545,10 @@ template<typename T = ATrafficSignBase>
 T * GetClosestTrafficSignActor(const carla::road::Signal &Signal, UWorld* World)
 {
   auto CarlaTransform = Signal.GetTransform();
+  // The signal transform carries the OpenDRIVE zOffset (mounting height of
+  // the plate above the road); baked sign actors have their pivot at road
+  // level, so match against the road-level position.
+  CarlaTransform.location.z -= static_cast<float>(Signal.GetZOffset());
   FTransform UETransform(CarlaTransform);
   FVector Location = UETransform.GetLocation();
   // max distance to match 500cm
@@ -579,6 +637,10 @@ void ATrafficLightManager::SpawnTrafficLights()
     }
     const auto& Signal = Signals.at(SignalId);
     auto CarlaTransform = Signal->GetTransform();
+    // The signal transform carries the OpenDRIVE zOffset (mounting height of
+    // the reference point above the road). The spawned blueprint models the
+    // whole signal with its pivot at the pole base, so spawn at road level.
+    CarlaTransform.location.z -= static_cast<float>(Signal->GetZOffset());
     auto ClosestWaypointToSignal =
         GetMap()->GetClosestWaypointOnRoad(CarlaTransform.location);
 
@@ -681,6 +743,11 @@ void ATrafficLightManager::SpawnSignals()
         continue;
       }
       auto CarlaTransform = Signal->GetTransform();
+      // The signal transform carries the OpenDRIVE zOffset (mounting height
+      // of the plate above the road, e.g. ~2.3 m for Town12 stop signs). The
+      // spawned blueprint models the whole sign with its pivot at the pole
+      // base, so spawn at road level or the sign floats by exactly zOffset.
+      CarlaTransform.location.z -= static_cast<float>(Signal->GetZOffset());
       FTransform SpawnTransform(CarlaTransform);
       FVector SpawnLocation = SpawnTransform.GetLocation();
       FRotator SpawnRotation(SpawnTransform.GetRotation());
@@ -738,6 +805,9 @@ void ATrafficLightManager::SpawnSignals()
             SpeedLimitModels.Contains(Signal->GetSubtype().c_str()))
     {
       auto CarlaTransform = Signal->GetTransform();
+      // Spawn at road level: the blueprint pivot is at the pole base (see
+      // the zOffset note on the traffic-sign branch above).
+      CarlaTransform.location.z -= static_cast<float>(Signal->GetZOffset());
       FTransform SpawnTransform(CarlaTransform);
       FVector SpawnLocation = SpawnTransform.GetLocation();
       FRotator SpawnRotation(SpawnTransform.GetRotation());

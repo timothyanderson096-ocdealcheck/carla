@@ -8,15 +8,94 @@
 #include "CarlaLightSubsystem.h"
 #include "Carla/Game/CarlaStatics.h"
 
+#include <util/ue-header-guard-begin.h>
+#include "Components/PointLightComponent.h"
+#include "HAL/IConsoleManager.h"
+#include <util/ue-header-guard-end.h>
+
+// The CARLA light content (street lamps, building lights...) was authored for
+// UE4: a street lamp's CarlaLight ships intensity ~20, and the lamp blueprints
+// feed that same number both to the light component's SetIntensity AND to the
+// mesh material's EmissiveIntensity parameter (the glowing bulb). Under
+// UE 5.8's inverse-square photometric units, 20 lumens emits next to nothing
+// and night scenes render black. Scaling CarlaLight::LightIntensity itself (a
+// previous fix, x10000) cannot work: the blueprint pushes that one value to
+// both sinks, so any factor that makes the light visible also drives the
+// material emissive to hundreds of thousands and turns every pole into a
+// white-hot rod that drags the auto-exposure down and blinds the scene.
+// Instead, keep LightIntensity at its authored value (the emissive path and
+// the client-facing light API stay UE4-compatible) and scale the LIGHT
+// COMPONENT's intensity right after every code path that lets the blueprint
+// push authored values into it (see ApplyLegacyComponentConversion).
+// Same story for attenuation radius: UE4-era lamp content ships spot/point
+// lights with ~10-16 m attenuation, so even a bright lamp lights almost
+// nothing under UE5 -- the pool dies a few meters past each pole. Enforce a
+// minimum radius on every light component of a registered CarlaLight;
+// 7000 cm (70 m) lets 30 m-spaced street lamp pools overlap with inverse-
+// square falloff doing the actual attenuation well before the cutoff.
+static TAutoConsoleVariable<float> CVarCarlaLightMinAttenuationRadius(
+    TEXT("carla.Light.MinAttenuationRadius"),
+    7000.0f,
+    TEXT("Minimum attenuation radius (cm) enforced on the light components of every ")
+    TEXT("registered CarlaLight. Set 0 to leave authored radii untouched."),
+    ECVF_Default);
+
+// Two scales, split by light type. The content itself defines the street
+// factor: the re-authored legacy street lamps (00_LegacyAssets) carry
+// CarlaLight intensities of 6-10 MILLION where the modern blueprints carry
+// 12-20 -- a ratio of ~500k -- and those legacy values are what reads as a
+// proper lamp pool under this project's fixed day-calibrated exposure
+// (auto exposure is disabled project-wide). Building/other/vehicle lights
+// are far denser per map (hundreds on Town10), so the same factor floods the
+// whole town white; they keep the older, milder calibration.
+static TAutoConsoleVariable<float> CVarCarlaLightStreetIntensityScale(
+    TEXT("carla.Light.StreetIntensityScale"),
+    500000.0f,
+    TEXT("Multiplier converting small UE4-era CarlaLight intensities of STREET lights to UE5 ")
+    TEXT("photometric units, applied to the owner's light components after every blueprint ")
+    TEXT("intensity push. Set 1 to leave component intensities untouched."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarCarlaLightLegacyIntensityScale(
+    TEXT("carla.Light.LegacyIntensityScale"),
+    10000.0f,
+    TEXT("Multiplier converting small UE4-era CarlaLight intensities of non-street lights ")
+    TEXT("(building, vehicle, other) to UE5 photometric units, applied to the owner's light ")
+    TEXT("components after every blueprint intensity push. Set 1 to leave component ")
+    TEXT("intensities untouched."),
+    ECVF_Default);
+
+// Blueprint pushes write ABSOLUTE authored values (tens to hundreds) into the
+// component; the conversion then multiplies the component intensity by the
+// scale above (giving hundreds of thousands to millions). Values already at
+// converted magnitude must not be scaled again when the conversion re-runs
+// after a state change whose blueprint handler did not push a fresh
+// intensity. Authored UE4 content tops out around a few hundred, so anything
+// at or above this threshold is treated as already converted.
+static constexpr float CarlaLightMaxAuthoredIntensity = 1000.0f;
+
 UCarlaLight::UCarlaLight()
 {
   PrimaryComponentTick.bCanEverTick = false;
+}
+
+void UCarlaLight::OnRegister()
+{
+  Super::OnRegister();
+  RegisterLight();
 }
 
 void UCarlaLight::BeginPlay()
 {
   Super::BeginPlay();
 
+  // A fresh BeginPlay means this instance is not registered with this
+  // world's subsystem, whatever a copied flag claims: template-based
+  // spawning (PCG Spawn Actor and friends) copies the template component's
+  // flags wholesale, which used to make every cloned street light skip
+  // registration (1 of 133 PCG-spawned lamps registered), and EndPlay never
+  // cleared the flag either.
+  flags &= ~ECarlaLightFlags::Registered;
   RegisterLight();
 }
 
@@ -27,17 +106,45 @@ void UCarlaLight::RegisterLight()
     return;
   }
 
+  if (GetOwner() != nullptr)
+  {
+    ActivateAndConfigureLightComponents(GetOwner());
+  }
+
+  ApplyLegacyComponentConversion();
+
   UWorld *World = GetWorld();
   if (World != nullptr)
   {
-    UCarlaLightSubsystem* CarlaLightSubsystem = World->GetSubsystem<UCarlaLightSubsystem>();
-    CarlaLightSubsystem->RegisterLight(this);
+    // OnRegister now runs for every world, including inactive worlds
+    // (e.g. double-clicking a map asset in the Content Browser opens an
+    // EWorldType::Inactive preview world). UCarlaLightSubsystem doesn't
+    // support that world type, so GetSubsystem returns nullptr there.
+    if (UCarlaLightSubsystem* CarlaLightSubsystem = World->GetSubsystem<UCarlaLightSubsystem>())
+    {
+      CarlaLightSubsystem->RegisterLight(this);
+    }
   }
   flags |= ECarlaLightFlags::Registered;
 }
 
 void UCarlaLight::OnComponentDestroyed(bool bDestroyingHierarchy)
 {
+  // OnRegister above now registers in the editor too, not just BeginPlay --
+  // so a component actually destroyed (level edit, not just a construction-
+  // script re-register, which doesn't hit this at all) needs to unregister
+  // here too, or deleting a light in the editor leaves a dangling pointer in
+  // the subsystem until the next EndPlay/Deinitialize. Safe to call
+  // alongside EndPlay's own unregister: both go through UnregisterLight,
+  // which no-ops if already absent.
+  UWorld* World = GetWorld();
+  if (World != nullptr)
+  {
+    if (UCarlaLightSubsystem* CarlaLightSubsystem = World->GetSubsystem<UCarlaLightSubsystem>())
+      CarlaLightSubsystem->UnregisterLight(this);
+  }
+  flags &= ~ECarlaLightFlags::Registered;
+
   Super::OnComponentDestroyed(bDestroyingHierarchy);
 }
 
@@ -49,13 +156,97 @@ void UCarlaLight::EndPlay(const EEndPlayReason::Type EndPlayReason)
     UCarlaLightSubsystem* CarlaLightSubsystem = World->GetSubsystem<UCarlaLightSubsystem>();
     CarlaLightSubsystem->UnregisterLight(this);
   }
+  // Allow re-registration if this component gets a new BeginPlay (level
+  // streaming, actor reuse); the flag used to stay set forever.
+  flags &= ~ECarlaLightFlags::Registered;
   Super::EndPlay(EndPlayReason);
+}
+
+void UCarlaLight::ApplyLegacyComponentConversion()
+{
+  if (GetOwner() == nullptr)
+  {
+    return;
+  }
+  ScaleLightComponentIntensities(GetOwner(), LightType);
+}
+
+void UCarlaLight::ActivateAndConfigureLightComponents(AActor* Owner)
+{
+  // Widen undersized authored attenuation radii so the light actually
+  // reaches the road (see cvar comment above).
+  const float MinRadius = CVarCarlaLightMinAttenuationRadius.GetValueOnGameThread();
+  if (MinRadius <= 0.0f || Owner == nullptr)
+  {
+    return;
+  }
+  TArray<UPointLightComponent*> LightComponents;
+  Owner->GetComponents<UPointLightComponent>(LightComponents);
+  for (UPointLightComponent* LightComponent : LightComponents)
+  {
+    if (LightComponent->AttenuationRadius < MinRadius)
+    {
+      LightComponent->SetAttenuationRadius(MinRadius);
+    }
+    // Lamp blueprints commonly embed the light inside the opaque lamp-head
+    // mesh; with shadow casting on, the head fully occludes its own light
+    // and the lamp illuminates nothing. Street furniture doesn't need
+    // per-lamp shadows.
+    LightComponent->SetCastShadows(false);
+    // Some lamp content ships decorative IES gobos (e.g. XArrowDiffuse on
+    // BP_StreetLight01) that mask virtually all of the light's output; a
+    // street light needs its raw cone. Drop the profile.
+    LightComponent->SetIESTexture(nullptr);
+    // Registered lights are driven at runtime (day/night, client API);
+    // Stationary components with no built lighting contribute nothing in
+    // -game. Make them movable so they always render dynamically.
+    LightComponent->SetMobility(EComponentMobility::Movable);
+    // UE4-era lamp content ships light components with bAutoActivate off
+    // (UE4 rendered lights regardless of active state, so nobody noticed);
+    // UE5 culls inactive light components outright, which blacked out
+    // every lamp no matter the intensity. Activate them -- on/off is
+    // driven through intensity/visibility by the blueprints, not through
+    // component activation.
+    if (!LightComponent->IsActive())
+    {
+      LightComponent->SetActive(true);
+    }
+  }
+}
+
+float UCarlaLight::GetLegacyIntensityScale(ELightType LightType)
+{
+  return (LightType == ELightType::Street)
+      ? CVarCarlaLightStreetIntensityScale.GetValueOnGameThread()
+      : CVarCarlaLightLegacyIntensityScale.GetValueOnGameThread();
+}
+
+void UCarlaLight::ScaleLightComponentIntensities(AActor* Owner, ELightType LightType)
+{
+  const float Scale = GetLegacyIntensityScale(LightType);
+  if (Scale == 1.0f || Owner == nullptr)
+  {
+    return;
+  }
+  TArray<UPointLightComponent*> LightComponents;
+  Owner->GetComponents<UPointLightComponent>(LightComponents);
+  for (UPointLightComponent* LightComponent : LightComponents)
+  {
+    const float Current = LightComponent->Intensity;
+    UE_LOG(LogCarla, VeryVerbose, TEXT("CarlaLight conversion: owner %s component %s intensity %f visible %d"),
+        *Owner->GetName(), *LightComponent->GetName(), Current, LightComponent->IsVisible() ? 1 : 0);
+    if (Current > 0.0f && Current < CarlaLightMaxAuthoredIntensity)
+    {
+      LightComponent->SetIntensity(Current * Scale);
+    }
+  }
 }
 
 void UCarlaLight::SetLightIntensity(float Intensity)
 {
   LightIntensity = Intensity;
   UpdateLights();
+  ApplyLegacyComponentConversion();
 }
 
 float UCarlaLight::GetLightIntensity() const
@@ -67,6 +258,7 @@ void UCarlaLight::SetLightColor(FLinearColor Color)
 {
   LightColor = Color;
   UpdateLights();
+  ApplyLegacyComponentConversion();
   RecordLightChange();
 }
 
@@ -77,9 +269,40 @@ FLinearColor UCarlaLight::GetLightColor() const
 
 void UCarlaLight::SetLightOn(bool bOn)
 {
-  flags |= ECarlaLightFlags::TurnedOn;
+  flags = bOn ? (flags | ECarlaLightFlags::TurnedOn) : (flags & ~ECarlaLightFlags::TurnedOn);
   UpdateLights();
+  ApplyLightOnToComponents(bOn);
+  ApplyLegacyComponentConversion();
   RecordLightChange();
+}
+
+void UCarlaLight::HandleDayTimeChanged(bool bIsDay)
+{
+  DayTimeChanged(bIsDay);
+  // Street already auto-toggled; Building and Vehicle (parked-car decoration,
+  // not the ego vehicle's driver-controlled lights) should too -- "Other" is
+  // left alone, its members are too varied to assume night-on is always right.
+  if (LightType == ELightType::Street
+      || LightType == ELightType::Building
+      || LightType == ELightType::Vehicle)
+  {
+    SetLightOn(!bIsDay);
+  }
+}
+
+void UCarlaLight::ApplyLightOnToComponents(bool bOn)
+{
+  AActor* Owner = GetOwner();
+  if (Owner == nullptr)
+  {
+    return;
+  }
+  TArray<UPointLightComponent*> LightComponents;
+  Owner->GetComponents<UPointLightComponent>(LightComponents);
+  for (UPointLightComponent* LightComponent : LightComponents)
+  {
+    LightComponent->SetVisibility(bOn);
+  }
 }
 
 bool UCarlaLight::GetLightOn() const
@@ -117,16 +340,22 @@ void UCarlaLight::SetLightState(carla::rpc::LightState LightState)
   LightIntensity = LightState._intensity;
   LightColor = LightState._color;
   LightType = static_cast<ELightType>(LightState._group);
-  flags |= LightState._active ? ECarlaLightFlags::TurnedOn : ECarlaLightFlags();
+  flags = LightState._active ? (flags | ECarlaLightFlags::TurnedOn) : (flags & ~ECarlaLightFlags::TurnedOn);
   UpdateLights();
+  ApplyLightOnToComponents(LightState._active);
+  ApplyLegacyComponentConversion();
   RecordLightChange();
 }
 
 FVector UCarlaLight::GetLocation() const
 {
-  auto Location = GetOwner()->GetActorLocation();
+  // Reached from the RPC thread (get_lights); during a map transition or a
+  // World Partition stream-out the owner and the game mode can be gone
+  // while this component is still registered.
+  const AActor* Owner = GetOwner();
+  auto Location = Owner ? Owner->GetActorLocation() : FVector::ZeroVector;
   ACarlaGameModeBase* GameMode = UCarlaStatics::GetGameMode(GetWorld());
-  ALargeMapManager* LargeMap = GameMode->GetLMManager();
+  ALargeMapManager* LargeMap = GameMode ? GameMode->GetLMManager() : nullptr;
   if (LargeMap)
   {
     Location = LargeMap->LocalToGlobalLocation(Location);
